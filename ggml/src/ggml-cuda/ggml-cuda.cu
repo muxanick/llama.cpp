@@ -3280,14 +3280,22 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
     return use_cuda_graph;
 }
 
-static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
+static const void * ggml_cuda_graph_get_key(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph) {
+    // Honor external key hint when set; fall back to cgraph->nodes[0]. The hint
+    // is cleared once at end of ggml_backend_cuda_graph_compute so it cannot
+    // leak across compute calls. Useful when nodes[0] is not identity-stable
+    // (e.g. cgraph ctx is freed + re-initialized between iterations).
+    const void * hint = cuda_ctx->next_graph_key_hint.load(std::memory_order_relaxed);
+    if (hint) {
+        return hint;
+    }
     return cgraph->nodes[0];
 }
 
 static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph) {
     bool res = false;
 
-    const void * graph_key = ggml_cuda_graph_get_key(cgraph);
+    const void * graph_key = ggml_cuda_graph_get_key(cuda_ctx, cgraph);
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
 
     if (cgraph->uid != 0 &&
@@ -3305,6 +3313,24 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
         graph->node_props.resize(cgraph->n_nodes);
     }
 
+    // The stock `memcmp(&graph->node_props[i], &prop, sizeof(prop))` below catches
+    // uninitialized PADDING bytes inside the embedded ggml_tensor (e.g. the 4 bytes
+    // between `type` enum at offset 0-3 and `buffer` pointer at offset 8-15). The
+    // CUDA allocator does not guarantee zero-filled padding, so any cgraph->nodes[i]
+    // whose padding carries non-zero garbage will spuriously diff against a
+    // prior-stored copy whose padding came from a different allocation. The
+    // GGML_CUDA_PROPS_SKIP_PADDING env-gate replaces the whole-struct memcmp with
+    // explicit field compares that skip padding entirely. Empirically observed on
+    // Qwen3.6-MoE workloads: ~50+ spurious resets per inference at default
+    // settings, dropping to 0 with the env set. NOTE: `name` and `extra` are
+    // intentionally NOT compared — `name` is a per-tensor identifier and `extra`
+    // is the CUDA backend's per-tensor scratch slot which may legitimately differ
+    // between rebuilds without invalidating the graph plan.
+    static const bool s_skip_padding = []{
+        const char * e = getenv("GGML_CUDA_PROPS_SKIP_PADDING");
+        return e != nullptr && e[0] != '0' && e[0] != '\0';
+    }();
+
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_cuda_graph::node_properties prop = {};
         memcpy(&prop.node, cgraph->nodes[i], sizeof(ggml_tensor));
@@ -3317,7 +3343,41 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
             }
         }
 
-        if (res || memcmp(&graph->node_props[i], &prop, sizeof(prop)) != 0) {
+        bool prop_differs;
+        if (s_skip_padding) {
+            const ggml_tensor & b_t = graph->node_props[i].node;
+            const ggml_tensor & a_t = prop.node;
+            prop_differs = (b_t.type != a_t.type)
+                        || (b_t.op != a_t.op)
+                        || (b_t.flags != a_t.flags)
+                        || (b_t.buffer != a_t.buffer)
+                        || (b_t.data != a_t.data)
+                        || (b_t.view_src != a_t.view_src)
+                        || (b_t.view_offs != a_t.view_offs)
+                        || memcmp(b_t.ne, a_t.ne, sizeof(b_t.ne)) != 0
+                        || memcmp(b_t.nb, a_t.nb, sizeof(b_t.nb)) != 0
+                        || memcmp(b_t.op_params, a_t.op_params, sizeof(b_t.op_params)) != 0;
+            if (!prop_differs) {
+                for (int j = 0; j < GGML_MAX_SRC; ++j) {
+                    if (b_t.src[j] != a_t.src[j]) { prop_differs = true; break; }
+                }
+            }
+            if (!prop_differs) {
+                prop_differs = memcmp(graph->node_props[i].node_src_data_ptrs,
+                                      prop.node_src_data_ptrs,
+                                      sizeof(prop.node_src_data_ptrs)) != 0
+                            || memcmp(graph->node_props[i].node_src_ne,
+                                      prop.node_src_ne,
+                                      sizeof(prop.node_src_ne)) != 0
+                            || memcmp(graph->node_props[i].node_src_nb,
+                                      prop.node_src_nb,
+                                      sizeof(prop.node_src_nb)) != 0;
+            }
+        } else {
+            prop_differs = memcmp(&graph->node_props[i], &prop, sizeof(prop)) != 0;
+        }
+
+        if (res || prop_differs) {
             graph->node_props[i] = prop;
             res = true;
         }
@@ -4461,7 +4521,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     const void * graph_key = nullptr;
 
 #ifdef USE_CUDA_GRAPH
-    graph_key = ggml_cuda_graph_get_key(cgraph);
+    graph_key = ggml_cuda_graph_get_key(cuda_ctx, cgraph);
 
     ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
 
@@ -4507,6 +4567,11 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
 
+#ifdef USE_CUDA_GRAPH
+    // Clear any external graph-key hint so it cannot leak to the next compute call.
+    cuda_ctx->next_graph_key_hint.store(nullptr, std::memory_order_relaxed);
+#endif
+
     return GGML_STATUS_SUCCESS;
 }
 
@@ -4539,7 +4604,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
 #ifdef USE_CUDA_GRAPH
-    const void * graph_key = ggml_cuda_graph_get_key(cgraph);
+    const void * graph_key = ggml_cuda_graph_get_key(cuda_ctx, cgraph);
     const bool use_cuda_graph = ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
 #else
     const bool use_cuda_graph = false;
@@ -5180,6 +5245,11 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_Q5_0:
                     case GGML_TYPE_Q5_1:
                     case GGML_TYPE_Q8_0:
+                    case GGML_TYPE_Q2_K:
+                    case GGML_TYPE_Q3_K:
+                    case GGML_TYPE_Q4_K:
+                    case GGML_TYPE_Q5_K:
+                    case GGML_TYPE_Q6_K:
                         return true;
                     default:
                         return false;

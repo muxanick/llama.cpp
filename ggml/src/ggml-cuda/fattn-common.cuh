@@ -913,6 +913,20 @@ static __global__ void flash_attn_combine_results(
     dst[tid] = VKQ_numerator / VKQ_denominator;
 }
 
+// Env-gated parallel_blocks override. When GGML_FATTN_FIXED_PARALLEL_BLOCKS is
+// set to a positive int, fix the FA kernel's parallel_blocks at that constant
+// regardless of K->ne[1]. This decouples gridDim.y from the FA src view's
+// KV-sequence dimension so a captured CUDA graph can be reused across bucket
+// transitions via cudaGraphExecUpdate. Scoped to ncols==1 (vec FA / AR decode)
+// — the prefill kernels (ncols>1, mma-f16 / tile) lack the gridDim.y-stride
+// safety of fattn-vec.cuh and would corrupt their dst_tmp under fixed blocks.
+// Pair with GGML_CUDA_PROPS_SKIP_PADDING in ggml-cuda.cu to keep graph keys
+// stable across rebuilds.
+static const int g_fattn_fixed_parallel_blocks = []{
+    const char * e = getenv("GGML_FATTN_FIXED_PARALLEL_BLOCKS");
+    return (e && *e) ? atoi(e) : 0;
+}();
+
 template <int DV, int ncols1, int ncols2>
 void launch_fattn(
     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
@@ -1070,7 +1084,12 @@ void launch_fattn(
         blocks_num.z = 1;
 
         if(use_stream_k) {
-            const int nblocks_stream_k_raw = std::min(max_blocks, ntiles_KV*ntiles_dst);
+            // GGML_FATTN_FIXED_PARALLEL_BLOCKS scoped to ncols==1: substitute
+            // the env-supplied constant for ntiles_KV so cudaGraphExecUpdate
+            // can patch the runtime arg without grid-dim change.
+            const bool fa_fixed = (g_fattn_fixed_parallel_blocks > 0) && (ncols == 1);
+            const int kv_factor = fa_fixed ? g_fattn_fixed_parallel_blocks : ntiles_KV;
+            const int nblocks_stream_k_raw = std::min(max_blocks, kv_factor*ntiles_dst);
             // Round down to a multiple of ntiles_dst so that each output tile gets the same number of blocks (avoids fixup).
             // Only do this if the occupancy loss from rounding is acceptable.
             const int nblocks_stream_k_rounded = (nblocks_stream_k_raw / ntiles_dst) * ntiles_dst;
@@ -1089,28 +1108,35 @@ void launch_fattn(
             dst_tmp_meta.alloc((size_t(blocks_num.x) * ncols * (2 + DV/2)));
         }
     } else {
-        // parallel_blocks must not be larger than what the tensor size allows:
-        parallel_blocks = std::min(parallel_blocks, ntiles_KV);
+        // GGML_FATTN_FIXED_PARALLEL_BLOCKS scoped to ncols==1: skip the dynamic
+        // efficiency search and lock parallel_blocks at the env-supplied value.
+        const bool fa_fixed = (g_fattn_fixed_parallel_blocks > 0) && (ncols == 1);
+        if (fa_fixed) {
+            parallel_blocks = g_fattn_fixed_parallel_blocks;
+        } else {
+            // parallel_blocks must not be larger than what the tensor size allows:
+            parallel_blocks = std::min(parallel_blocks, ntiles_KV);
 
-        // If ntiles_total % blocks_per_wave != 0 then some efficiency is lost due to tail effects.
-        // Test whether parallel_blocks can be set to a higher value for better efficiency.
-        const int blocks_per_wave = nsm * max_blocks_per_sm;
-        int nwaves_best = 0;
-        int efficiency_percent_best = 0;
-        for (int parallel_blocks_test = parallel_blocks; parallel_blocks_test <= ntiles_KV; ++parallel_blocks_test) {
-            const int nblocks_total = ntiles_dst * parallel_blocks_test;
-            const int nwaves = (nblocks_total + blocks_per_wave - 1) / blocks_per_wave;
-            const int efficiency_percent = 100 * nblocks_total / (nwaves*blocks_per_wave);
+            // If ntiles_total % blocks_per_wave != 0 then some efficiency is lost due to tail effects.
+            // Test whether parallel_blocks can be set to a higher value for better efficiency.
+            const int blocks_per_wave = nsm * max_blocks_per_sm;
+            int nwaves_best = 0;
+            int efficiency_percent_best = 0;
+            for (int parallel_blocks_test = parallel_blocks; parallel_blocks_test <= ntiles_KV; ++parallel_blocks_test) {
+                const int nblocks_total = ntiles_dst * parallel_blocks_test;
+                const int nwaves = (nblocks_total + blocks_per_wave - 1) / blocks_per_wave;
+                const int efficiency_percent = 100 * nblocks_total / (nwaves*blocks_per_wave);
 
-            // Stop trying configurations with more waves if we already have good efficiency to avoid excessive overhead.
-            if (efficiency_percent_best >= 95 && nwaves > nwaves_best) {
-                break;
-            }
+                // Stop trying configurations with more waves if we already have good efficiency to avoid excessive overhead.
+                if (efficiency_percent_best >= 95 && nwaves > nwaves_best) {
+                    break;
+                }
 
-            if (efficiency_percent > efficiency_percent_best) {
-                nwaves_best = nwaves;
-                efficiency_percent_best = efficiency_percent;
-                parallel_blocks = parallel_blocks_test;
+                if (efficiency_percent > efficiency_percent_best) {
+                    nwaves_best = nwaves;
+                    efficiency_percent_best = efficiency_percent;
+                    parallel_blocks = parallel_blocks_test;
+                }
             }
         }
 

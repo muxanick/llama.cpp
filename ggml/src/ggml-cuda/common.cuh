@@ -1377,6 +1377,16 @@ struct ggml_backend_cuda_context {
     // when the computation is split across CPU/GPU (e.g., with --n-cpu-moe)
     std::unordered_map<const void *, std::unique_ptr<ggml_cuda_graph>> cuda_graphs;
 
+    // Explicit graph-key hint. Callers (e.g. an external scheduler / speculative
+    // decoder) can set this pointer just before invoking a compute pass to make
+    // ggml_cuda_graph_get_key return a stable key across rebuilds of the same
+    // logical step — without relying on cgraph->nodes[0] being identity-stable
+    // (which it isn't when the cgraph ctx is freed + re-init between iterations).
+    // Cleared once at end of ggml_backend_cuda_graph_compute so a stale hint
+    // cannot leak past one compute call. When null, ggml_cuda_graph_get_key
+    // falls back to cgraph->nodes[0].
+    std::atomic<const void *> next_graph_key_hint{nullptr};
+
     int64_t last_graph_eviction_sweep = 0;
 
     ggml_cuda_graph * cuda_graph(const void * first_node_ptr) {
