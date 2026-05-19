@@ -14,15 +14,18 @@
 
 ## What's in the bundle
 
-Four CUDA-backend optimizations on top of `upstream/master`
-(`d14ce3dab` post-MTP-merge, b9235). All four are env-gated where they
-change behavior, except the K-quant kernels which are pure additions.
+Five CUDA-backend optimizations on top of `upstream/master`
+(`d14ce3dab` post-MTP-merge, b9235). Env-gated where they change
+behavior; the K-quant kernels and the CUDA FWHT kernel are pure
+additions that only engage when the corresponding code paths are
+exercised.
 
 | Component | Files | Behavior change |
 |---|---|---|
 | **c1** K-quant `get_rows` kernels (Q2_K..Q6_K) | `ggml-cuda/getrows.cu`, `ggml-cuda/ggml-cuda.cu` (supports_op) | Always on — fills a gap (upstream rejected K-quant `get_rows` as unsupported pre-this-branch) |
 | **c2** `ggml_cuda_graph_update_required` skip-padding | `ggml-cuda/ggml-cuda.cu` (~line 3287) | Env-gated `GGML_CUDA_PROPS_SKIP_PADDING=1` |
 | **c3** FA fixed-parallel-blocks env-gate | `ggml-cuda/fattn-common.cuh` (~line 916+) | Env-gated `GGML_FATTN_FIXED_PARALLEL_BLOCKS=N`, scoped to `ncols==1` |
+| **c4** CUDA FWHT for `GGML_HINT_SRC0_IS_HADAMARD` | `ggml-cuda/fwht.cu`, `ggml-cuda/fwht.cuh`, `ggml-cuda/ggml-cuda.cu` (hint dispatch) | Always on — closes the CUDA gap left by merged PR #22631 (CPU FWHT) |
 | **c6** Explicit graph-key hint on `ggml_backend_cuda_context` | `ggml-cuda/common.cuh`, `ggml-cuda/ggml-cuda.cu` | Always plumbed; default (null hint) is byte-identical to master |
 
 ## Why each one exists (the diagnostic story)
@@ -105,6 +108,35 @@ excess blocks correctly: blocks beyond `ntiles_KV` produce zero-meta
 contributions, and the `expf(meta.x - kqmax) ~= 0` masking zeroes
 them out.
 
+### c4 — CUDA FWHT for `GGML_HINT_SRC0_IS_HADAMARD`
+
+PR #22631 (merged 2026-05-05) shipped a CPU implementation of the Fast
+Walsh-Hadamard Transform that runs when `ggml_mul_mat_set_hint(t,
+GGML_HINT_SRC0_IS_HADAMARD)` is set on a `MUL_MAT` node — replacing the
+$O(N^2)$ literal matmul against a Hadamard matrix with $O(N \log N)$
+FWHT on `src1`. The hint is set on two paths in `src/llama-graph.cpp`
+and `src/llama-kv-cache.cpp`. On the CPU backend the savings are real;
+on the CUDA backend, the hint was silently ignored and `ggml_cuda_mul_mat`
+fell through to a literal matmul.
+
+This component adds the CUDA-side dispatch hook in `ggml_cuda_mul_mat`
+(checks `op_params[1]` against `GGML_HINT_SRC0_IS_HADAMARD`, routes to
+the new `ggml_cuda_op_fwht` when set) and a CUDA kernel that mirrors
+the CPU algorithm: one CUDA block per row, threads cooperate via
+shared memory across `log2(n)` butterfly passes after a `1/sqrt(n)`
+scale. Block size is 128 (4 warps); shared-memory budget caps `n` at
+1024 elements per row, which is well above any Hadamard-using path in
+practice (the upstream callers use `head_dim`, typically 64-128).
+
+**Numeric note.** Both the pre- and post-c4 CUDA paths produce
+mathematically equivalent output — the pre-c4 path was correct (literal
+$H \cdot x$ with $H = $ scaled Hadamard equals $\mathrm{FWHT}(x)$) but
+slow ($O(n^2)$). c4 brings the algorithmic class to parity with CPU.
+
+**Validation.** `test-backend-ops -o MUL_MAT_HADAMARD` enables the 4
+existing FWHT test cases (n = 64, 128, 256; batch shapes 1, 32) for
+the CUDA backend; all pass byte-identically to the CPU reference.
+
 ### c6 — Explicit graph-key hint
 
 Discovered while building a bucket-aware speculative-decode loop where
@@ -167,14 +199,11 @@ paths and only matter when those paths are exercised.
 ## What's deliberately NOT in this bundle
 
 - **Multi-Token Prediction.** Already merged upstream via PR #22673
-  (Mr. am17an, 2026-05-16). Use `--spec-type draft-mtp` against
-  Unsloth's `Qwen3.6-35B-A3B-MTP-GGUF` or `Qwen3.6-27B-MTP-GGUF`.
-- **CPU FWHT for KV cache rotation.** Already merged upstream via
-  PR #22631 (AlrIsmail, 2026-05-05). This branch does NOT add the
-  matching CUDA kernel for `GGML_HINT_SRC0_IS_HADAMARD` — I started
-  but deferred to a follow-up; the CUDA backend still falls back to
-  plain `mul_mat` when the hint is set. The needed kernel is ~400
-  LOC and merits its own focused review.
+  (am17an, 2026-05-16). Use `--spec-type draft-mtp` against Unsloth's
+  `Qwen3.6-35B-A3B-MTP-GGUF` or `Qwen3.6-27B-MTP-GGUF`.
+- **CPU FWHT for KV cache rotation.** Already merged upstream via PR
+  #22631 (AlrIsmail, 2026-05-05). The matching CUDA kernel is now in
+  this bundle as c4 above.
 - **TurboQuant KV cache types.** See ongoing PR #21089 (elusznik).
 - **MoE expert-sum fusion / per-bucket cuda_graph map / `set_rows`
   fusion patterns** — these are tightly coupled to the downstream

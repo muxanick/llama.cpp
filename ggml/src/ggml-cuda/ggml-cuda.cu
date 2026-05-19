@@ -63,6 +63,7 @@
 #include "ggml-cuda/tri.cuh"
 #include "ggml-cuda/cumsum.cuh"
 #include "ggml-cuda/fill.cuh"
+#include "ggml-cuda/fwht.cuh"
 #include "ggml.h"
 
 #include <algorithm>
@@ -2535,6 +2536,16 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
 }
 
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    // Mirror ggml-cpu's mul_mat hint dispatch: when src0 is encoded as the
+    // implicit Hadamard matrix (op_params[1] == GGML_HINT_SRC0_IS_HADAMARD,
+    // see PR #22631), run the Fast Walsh-Hadamard Transform on src1 instead
+    // of a literal matmul. Closes the CUDA gap left by the merged CPU FWHT.
+    const int32_t hint = ggml_get_op_params_i32(dst, 1);
+    if (hint == GGML_HINT_SRC0_IS_HADAMARD) {
+        ggml_cuda_op_fwht(ctx, dst);
+        return;
+    }
+
     const bool split = ggml_backend_buft_is_cuda_split(src0->buffer->buft);
 
     // If src0 is a temporary compute buffer it may have some padding that needs to be cleared for mul_mat_vec_q or mul_mat_q.
